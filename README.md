@@ -30,18 +30,30 @@ Telegram-бот для управления WireGuard VPN с системой п
 
 **Provisioner Interface:**
 - Абстракция для управления WireGuard устройствами
-- `LocalProvisioner` - локальное управление (Stage 1)
-- `SSHProvisioner` - удаленное управление через SSH (Stage 2, placeholder)
+- `LocalProvisioner` - локальное управление (Stage 1, НЕ для продакшена)
+- `SSHProvisioner` - удаленное управление через SSH (Stage 2, продакшен)
+- `DevProvisioner` - мок для разработки (DEV_MODE=true)
 
-### Stage 2 (Будущее)
+### Stage 2 (RU → DE via SSH)
 
-Разделение на серверы:
-- **RU сервер**: Bot, Database, Billing, Access, Scheduler
-- **DE сервер**: WireGuard
-- **Связь**: SSH с allow-listed командами и machine-readable output
-- **Provisioner**: `SSHProvisioner` вместо `LocalProvisioner`
+Разделение на два сервера:
+- **RU сервер**: Telegram Bot, SQLite DB, Billing, Access Control, Scheduler
+  - НЕ содержит WireGuard интерфейса (wg1)
+  - Управляет DE сервером ТОЛЬКО по SSH
+- **DE сервер**: WireGuard (wg1)
+  - Все peers и IP адреса живут ТОЛЬКО здесь
+  - Управляется с RU сервера через SSH
+  - **Важно:** wg1 используется только Telegram-ботом, wg0 не затрагивается
+- **Связь**: SSH с allow-listed командой `/usr/local/bin/wg-provision`
+- **Provisioner**: `SSHProvisioner` (вместо `LocalProvisioner`)
 
-Архитектура позволяет переключиться на Stage 2 изменением одной строки в `NewWireguard()`.
+**Переключение на Stage 2:**
+Установите переменную окружения `SSH_WG_ENABLED=true` в `.env` файле на RU сервере.
+
+**Важно:**
+- RU сервер никогда не фигурирует в конфиге клиента
+- WireGuard endpoint для клиентов ВСЕГДА DE сервер
+- Никакого локального wg на RU сервере
 
 ## Пользовательский Flow
 
@@ -194,14 +206,71 @@ cd wireguard-telegram-bot-dev
 go mod download
 ```
 
-### Шаг 3: Настройка WireGuard
+### Шаг 3: Выбор режима работы
+
+#### Stage 1 (LocalProvisioner) - НЕ для продакшена
 
 1. Установите WireGuard и wireguard-tools на сервере
-2. Создайте серверный конфиг (например, `/etc/wireguard/wg0.conf`)
+2. Создайте серверный конфиг (например, `/etc/wireguard/wg1.conf`)
 3. Запустите WireGuard интерфейс:
    ```bash
-   sudo wg-quick up wg0
+   sudo wg-quick up wg1
    ```
+
+**Важно:** Stage 1 предназначен только для разработки. Для продакшена используйте Stage 2.
+
+#### Stage 2 (SSHProvisioner) - Продакшен
+
+**RU сервер:**
+- НЕ требует установки WireGuard
+- НЕ требует интерфейса wg1
+- Требует SSH доступ к DE серверу
+- Использует SQLite БД
+
+**DE сервер:**
+- Требует установки WireGuard и wireguard-tools
+- Требует интерфейса wg1 (используется только Telegram-ботом)
+- **Важно:** Интерфейс wg0 не затрагивается и может существовать параллельно
+- Требует установки скрипта `/usr/local/bin/wg-provision` (см. ниже)
+- Должен быть доступен по SSH с RU сервера
+
+**Установка wg-provision на DE сервере:**
+
+Скрипт `/usr/local/bin/wg-provision` должен поддерживать команды:
+
+**CREATE:**
+```bash
+wg-provision create \
+  --user-id <int> \
+  --subscription-id <int> \
+  --device-name "<string>" \
+  --public-key "<string>"
+```
+
+**RESPONSE (JSON):**
+```json
+{
+  "assigned_ip": "10.66.66.10/32",
+  "server_public_key": "<pubkey>",
+  "endpoint": "<DE_IP>:51820",
+  "dns": "8.8.8.8"
+}
+```
+
+**Важно:**
+- DE сервер возвращает только данные, НЕ генерирует client_config
+- RU сервер генерирует client_config самостоятельно используя шаблоны
+- assigned_ip - единственный источник истины (выделяется на DE сервере)
+
+**REVOKE:**
+```bash
+wg-provision revoke --assigned-ip "<ip>"
+```
+
+**RESPONSE (JSON):**
+```json
+{ "ok": true }
+```
 
 ### Шаг 4: Настройка переменных окружения
 
@@ -210,10 +279,12 @@ cp .env.example .env
 # Отредактируйте .env файл
 ```
 
+#### Stage 1 (LocalProvisioner) - переменные окружения:
+
 Обязательные переменные:
 - `TELEGRAM_APITOKEN` - токен бота от @BotFather
 - `STATIC_QR_CODE` - статический QR-код для оплаты (текст или URL)
-- `WIREGUARD_INTERFACE` - имя интерфейса WireGuard (например, `wg0`)
+- `WIREGUARD_INTERFACE` - имя интерфейса WireGuard (например, `wg1`)
 - `SERVER_ENDPOINT` - внешний IP:порт сервера (например, `123.45.67.89:51820`)
 - `DNS_IPS` - DNS серверы через запятую (например, `8.8.8.8,8.8.4.4`)
 
@@ -221,6 +292,61 @@ cp .env.example .env
 - `ADMIN_USERNAMES` - Telegram username'ы администраторов через запятую
 - `DATABASE_DSN` - путь к SQLite файлу (по умолчанию `bot.db`)
 - `DEV_MODE` - `true` для тестирования без реального WireGuard
+
+#### Stage 2 (SSHProvisioner) - переменные окружения:
+
+**На RU сервере:**
+
+Обязательные переменные:
+- `TELEGRAM_APITOKEN` - токен бота от @BotFather
+- `STATIC_QR_CODE` - статический QR-код для оплаты (текст или URL)
+- `SSH_WG_ENABLED=true` - включить SSH provisioning
+- `SSH_WG_HOST` - IP или hostname DE сервера (например, `10.0.0.2` или `de-server.example.com`)
+- `SSH_WG_PORT` - SSH порт DE сервера (по умолчанию `22`)
+- `SSH_WG_USER` - SSH username для подключения к DE серверу
+- `SSH_WG_KEY_PATH` - путь к SSH приватному ключу для подключения к DE серверу
+
+Опциональные:
+- `ADMIN_USERNAMES` - Telegram username'ы администраторов через запятую
+- `DATABASE_DSN` - путь к SQLite файлу (по умолчанию `bot.db`)
+
+**Важно:**
+- RU сервер НЕ требует `WIREGUARD_INTERFACE`, `SERVER_ENDPOINT`, `DNS_IPS` (они нужны только для Stage 1)
+- `SERVER_ENDPOINT` в клиентском конфиге берется из ответа DE сервера (поле `endpoint`)
+- Client config генерируется на RU сервере используя шаблоны из данных DE сервера
+
+**Пример .env для Stage 2 (RU сервер):**
+```bash
+TELEGRAM_APITOKEN=your_bot_token
+STATIC_QR_CODE=your_static_qr_code
+SSH_WG_ENABLED=true
+# Telegram
+TELEGRAM_APITOKEN=your_bot_token
+ADMIN_USERNAMES=admin1,admin2
+
+# Mode
+DEV_MODE=false
+SSH_WG_ENABLED=true
+
+# SSH to DE server
+SSH_WG_HOST=10.0.0.2
+SSH_WG_PORT=22
+SSH_WG_USER=wgadmin
+SSH_WG_KEY_PATH=/root/.ssh/wg_de_ed25519
+
+# Database
+DATABASE_DSN=bot.db
+
+# Payments
+STATIC_QR_CODE=your_static_qr_code
+# или PAYMENT_QR_PATH=assets/payment_qr.png
+```
+
+**Важно для безопасности:**
+- SSH ключ должен иметь правильные права доступа: `chmod 600 /path/to/ssh/private/key`
+- SSH ключ НЕ должен иметь пароль (или используйте ssh-agent)
+- На DE сервере должен быть настроен allow-listed доступ только для команды `/usr/local/bin/wg-provision`
+- НЕ храните SSH ключи в коде или репозитории
 
 ### Шаг 5: Запуск
 
@@ -233,7 +359,9 @@ go build -o wireguard-bot cmd/bot/main.go
 sudo ./wireguard-bot
 ```
 
-**Важно:** Для работы с WireGuard интерфейсом требуются права root (или CAP_NET_ADMIN).
+**Важно для Stage 1:** Для работы с WireGuard интерфейсом требуются права root (или CAP_NET_ADMIN).
+
+**Важно для Stage 2:** RU сервер НЕ требует WireGuard интерфейса и НЕ требует root прав для WireGuard. Проект должен успешно компилироваться и запускаться без wg на RU сервере.
 
 ## Тестовый сценарий
 
@@ -357,14 +485,25 @@ sudo ./wireguard-bot
 ### Provisioning
 
 **Stage 1 - LocalProvisioner:**
-- Управление через `wgctrl` (локальный WireGuard интерфейс)
+- Управление через `wgctrl` (локальный WireGuard интерфейс на том же сервере)
 - Атомарное выделение IP через DB транзакцию
 - Автоматическая генерация ключей и конфигов
+- **НЕ для продакшена** - используется только для разработки
 
-**Stage 2 - SSHProvisioner (placeholder):**
-- Удаленное управление через SSH
-- Allow-listed команды
-- Machine-readable output
+**Stage 2 - SSHProvisioner (продакшен):**
+- Удаленное управление через SSH (RU сервер → DE сервер)
+- Allow-listed команда: ТОЛЬКО `/usr/local/bin/wg-provision`
+- Machine-readable JSON output от DE сервера
+- Ключи генерируются на RU сервере
+- **DE сервер - единственный источник истины по assigned_ip** (RU НЕ резервирует IP)
+- Peer создается на DE сервере через SSH команду `wg-provision create`
+- Клиентский конфиг генерируется на RU сервере используя шаблоны и данные из JSON ответа DE сервера
+- Endpoint в клиентском конфиге ВСЕГДА DE сервер (никогда RU сервер)
+
+**Переключение режимов:**
+- `DEV_MODE=true` → DevProvisioner (тестирование)
+- `SSH_WG_ENABLED=true` → SSHProvisioner (Stage 2, продакшен)
+- иначе → LocalProvisioner (Stage 1, разработка, НЕ продакшен)
 
 ### Безопасность
 

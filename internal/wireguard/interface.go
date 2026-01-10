@@ -29,7 +29,10 @@ type wireguardWrapper struct {
 }
 
 // NewWireguard creates a new Wireguard instance using Provisioner
-// It uses LocalProvisioner for Stage 1 (MVP), can be replaced with SSHProvisioner in Stage 2
+// Provisioner selection:
+//   - DEV_MODE=true → DevProvisioner (for testing)
+//   - SSH_WG_ENABLED=true → SSHProvisioner (Stage 2: RU → DE via SSH)
+//   - otherwise → LocalProvisioner (Stage 1: local WireGuard, NOT for production)
 func NewWireguard(repo *storage.Repository) (Wireguard, error) {
 	var provisioner provisioning.Provisioner
 	var err error
@@ -38,8 +41,11 @@ func NewWireguard(repo *storage.Repository) (Wireguard, error) {
 	if devMode, _ := strconv.ParseBool(os.Getenv("DEV_MODE")); devMode {
 		// Use dev provisioner
 		provisioner, err = NewDevProvisioner(repo)
+	} else if sshEnabled, _ := strconv.ParseBool(os.Getenv("SSH_WG_ENABLED")); sshEnabled {
+		// Use SSH provisioner (Stage 2: RU → DE via SSH)
+		provisioner, err = provisioning.NewSSHProvisioner(repo)
 	} else {
-		// Use local provisioner (Stage 1)
+		// Use local provisioner (Stage 1: local WireGuard, NOT for production)
 		provisioner, err = provisioning.NewLocalProvisioner(repo)
 	}
 

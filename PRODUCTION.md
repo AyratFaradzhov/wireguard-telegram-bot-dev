@@ -160,3 +160,4 @@ sqlite3 /var/lib/wireguard-bot/bot.db "SELECT COUNT(*) FROM subscriptions WHERE 
 sqlite3 /var/lib/wireguard-bot/bot.db "SELECT COUNT(*) FROM devices WHERE revoked_at IS NULL;"
 ```
 
+

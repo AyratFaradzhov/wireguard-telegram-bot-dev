@@ -23,19 +23,45 @@ func main() {
 		log.Fatal("TELEGRAM_APITOKEN environment variable is required")
 	}
 
-	wgInterface := os.Getenv("WIREGUARD_INTERFACE")
-	if wgInterface == "" {
-		log.Fatal("WIREGUARD_INTERFACE environment variable is required")
+	// Check if using SSH provisioning (Stage 2) or local provisioning (Stage 1)
+	sshEnabled := os.Getenv("SSH_WG_ENABLED") == "true"
+	devMode := os.Getenv("DEV_MODE") == "true"
+
+	// For Stage 2 (SSHProvisioner), SSH variables are required
+	if sshEnabled {
+		sshHost := os.Getenv("SSH_WG_HOST")
+		if sshHost == "" {
+			log.Fatal("SSH_WG_HOST environment variable is required for Stage 2 (SSHProvisioner)")
+		}
+
+		sshUser := os.Getenv("SSH_WG_USER")
+		if sshUser == "" {
+			log.Fatal("SSH_WG_USER environment variable is required for Stage 2 (SSHProvisioner)")
+		}
+
+		sshKeyPath := os.Getenv("SSH_WG_KEY_PATH")
+		if sshKeyPath == "" {
+			log.Fatal("SSH_WG_KEY_PATH environment variable is required for Stage 2 (SSHProvisioner)")
+		}
 	}
 
-	serverEndpoint := os.Getenv("SERVER_ENDPOINT")
-	if serverEndpoint == "" {
-		log.Fatal("SERVER_ENDPOINT environment variable is required")
-	}
+	// For Stage 1 (LocalProvisioner), WIREGUARD_INTERFACE and SERVER_ENDPOINT are required
+	// For Stage 2 (SSHProvisioner), these are NOT required on RU server
+	if !sshEnabled && !devMode {
+		wgInterface := os.Getenv("WIREGUARD_INTERFACE")
+		if wgInterface == "" {
+			log.Fatal("WIREGUARD_INTERFACE environment variable is required for Stage 1 (LocalProvisioner)")
+		}
 
-	dnsIPs := os.Getenv("DNS_IPS")
-	if dnsIPs == "" {
-		log.Fatal("DNS_IPS environment variable is required")
+		serverEndpoint := os.Getenv("SERVER_ENDPOINT")
+		if serverEndpoint == "" {
+			log.Fatal("SERVER_ENDPOINT environment variable is required for Stage 1 (LocalProvisioner)")
+		}
+
+		dnsIPs := os.Getenv("DNS_IPS")
+		if dnsIPs == "" {
+			log.Fatal("DNS_IPS environment variable is required for Stage 1 (LocalProvisioner)")
+		}
 	}
 
 	staticQRCode := os.Getenv("STATIC_QR_CODE")

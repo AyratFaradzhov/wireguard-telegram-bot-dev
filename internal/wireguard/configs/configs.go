@@ -42,7 +42,15 @@ const (
 )
 
 var (
-	tmplFolder = os.Getenv("TEMPLATES_FOLDER")
+	// Get templates folder from env or use default (internal/wireguard/configs)
+	tmplFolder = func() string {
+		if folder := os.Getenv("TEMPLATES_FOLDER"); folder != "" {
+			return folder
+		}
+		// Default: use internal/wireguard/configs relative to current working directory
+		// In production, templates should be in the same directory as the binary
+		return "internal/wireguard/configs"
+	}()
 	clientTmpl = template.Must(
 		template.New(clientTmplFile).
 			Funcs(template.FuncMap{"join": strings.Join}).
