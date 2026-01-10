@@ -30,22 +30,18 @@ type wireguardWrapper struct {
 
 // NewWireguard creates a new Wireguard instance using Provisioner
 // Provisioner selection:
-//   - DEV_MODE=true → DevProvisioner (for testing)
-//   - SSH_WG_ENABLED=true → SSHProvisioner (Stage 2: RU → DE via SSH)
-//   - otherwise → LocalProvisioner (Stage 1: local WireGuard, NOT for production)
+//   - DEV_MODE=true → DevProvisioner (for testing, mock implementation)
+//   - otherwise → LocalProvisioner (local WireGuard via wgctrl)
 func NewWireguard(repo *storage.Repository) (Wireguard, error) {
 	var provisioner provisioning.Provisioner
 	var err error
 
 	// Check if using dev mode
 	if devMode, _ := strconv.ParseBool(os.Getenv("DEV_MODE")); devMode {
-		// Use dev provisioner
+		// Use dev provisioner (mock for testing)
 		provisioner, err = NewDevProvisioner(repo)
-	} else if sshEnabled, _ := strconv.ParseBool(os.Getenv("SSH_WG_ENABLED")); sshEnabled {
-		// Use SSH provisioner (Stage 2: RU → DE via SSH)
-		provisioner, err = provisioning.NewSSHProvisioner(repo)
 	} else {
-		// Use local provisioner (Stage 1: local WireGuard, NOT for production)
+		// Use local provisioner (local WireGuard via wgctrl)
 		provisioner, err = provisioning.NewLocalProvisioner(repo)
 	}
 
@@ -57,7 +53,6 @@ func NewWireguard(repo *storage.Repository) (Wireguard, error) {
 }
 
 // NewWireguardFromProvisioner creates a Wireguard instance from a Provisioner
-// This allows easy switching between LocalProvisioner and SSHProvisioner
 func NewWireguardFromProvisioner(provisioner provisioning.Provisioner) Wireguard {
 	return &wireguardWrapper{
 		provisioner: provisioner,

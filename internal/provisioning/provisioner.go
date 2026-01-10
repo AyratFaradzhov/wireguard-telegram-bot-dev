@@ -22,7 +22,7 @@ type ConfigResult struct {
 }
 
 // Provisioner is an interface for provisioning WireGuard devices
-// It abstracts the implementation details (local vs SSH-based)
+// It abstracts the implementation details (local WireGuard via wgctrl)
 type Provisioner interface {
 	// CreateDeviceWithNewKeys creates a new device with generated keys
 	// Returns the client config, public key, and assigned IP
