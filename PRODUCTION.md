@@ -161,3 +161,4 @@ sqlite3 /var/lib/wireguard-bot/bot.db "SELECT COUNT(*) FROM devices WHERE revoke
 ```
 
 
+

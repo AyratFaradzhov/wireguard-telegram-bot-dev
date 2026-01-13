@@ -49,6 +49,11 @@ func main() {
 		log.Fatal("STATIC_QR_CODE environment variable is required")
 	}
 
+	paymentQRPath := os.Getenv("PAYMENT_QR_PATH")
+	if paymentQRPath == "" {
+		log.Fatal("PAYMENT_QR_PATH environment variable is required")
+	}
+
 	// Initialize storage
 	dsn := os.Getenv("DATABASE_DSN")
 	if dsn == "" {
@@ -74,7 +79,7 @@ func main() {
 	accessService := access.NewService(repo)
 
 	// Initialize telegram bot
-	tg, err := telegram.NewBot(token, repo, billingService, accessService)
+	tg, err := telegram.NewBot(token, repo, billingService, accessService, paymentQRPath)
 	if err != nil {
 		log.Fatalf("failed to create telegram bot: %s", err.Error())
 	}

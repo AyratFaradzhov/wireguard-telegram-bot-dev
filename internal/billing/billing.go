@@ -127,10 +127,8 @@ func (s *Service) AdminApprovePayment(ctx context.Context, paymentID int64, revi
 		return fmt.Errorf("payment comment mismatch: expected '%s', got '%s'. Payment without correct comment MUST NOT be approved", payment.PaymentComment, verifiedComment)
 	}
 
-	// Verify proof is uploaded
-	if payment.ProofFileID == "" {
-		return errors.New("payment proof is not uploaded. Cannot approve payment without proof")
-	}
+	// Note: Proof verification is optional in simplified flow
+	// Admin can approve without proof if they verify payment manually
 
 	// Update payment status
 	if err := s.repo.UpdatePaymentStatus(ctx, paymentID, storage.PaymentStatusApproved, &reviewedBy); err != nil {

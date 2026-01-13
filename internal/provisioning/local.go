@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -98,7 +97,7 @@ func NewLocalProvisioner(repo *storage.Repository) (*LocalProvisioner, error) {
 }
 
 // getDeviceNames returns list of device names
-func getDeviceNames(devs []*wgctrl.Device) []string {
+func getDeviceNames(devs []*wgtypes.Device) []string {
 	names := make([]string, len(devs))
 	for i, d := range devs {
 		names[i] = d.Name

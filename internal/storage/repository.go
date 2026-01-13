@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 type Repository struct {
@@ -18,63 +20,76 @@ type Repository struct {
 
 // NewRepository creates a new repository instance
 func NewRepository(dsn string) (*Repository, error) {
+	log.Printf("Initializing repository with DSN: %s", dsn)
+	
+	// Handle file: prefix (remove it)
+	if strings.HasPrefix(dsn, "file:") {
+		dsn = strings.TrimPrefix(dsn, "file:")
+		log.Printf("Removed 'file:' prefix, using DSN: %s", dsn)
+	}
+	
 	// For SQLite in dev, PostgreSQL in production
-	// Check if dsn contains postgres:// or file:// pattern
+	// Check if dsn contains postgres:// pattern
 	var driver string
-	if len(dsn) > 0 && (dsn[0] == '/' || dsn == ":memory:") {
-		driver = "sqlite3"
-	} else if len(dsn) > 10 && dsn[:10] == "postgres://" {
+	if len(dsn) > 10 && strings.HasPrefix(dsn, "postgres://") {
 		driver = "postgres"
-		return nil, errors.New("PostgreSQL not yet implemented, use SQLite for now")
+		return nil, fmt.Errorf("PostgreSQL not yet implemented, use SQLite for now (DSN: %s)", dsn)
 	} else {
-		// Default to SQLite for development
-		driver = "sqlite3"
+		// Default to SQLite
+		driver = "sqlite"
 		if dsn == "" {
 			dsn = "bot.db"
+			log.Printf("DSN is empty, using default: %s", dsn)
 		}
 	}
 
+	log.Printf("Using driver: %s, DSN: %s", driver, dsn)
+
 	var db *sql.DB
 	var err error
-	if driver == "sqlite3" {
+	if driver == "sqlite" {
 		// For file-based SQLite, ensure directory exists and is writable
 		if dsn != ":memory:" {
 			// Resolve absolute path
 			absPath, err := filepath.Abs(dsn)
 			if err != nil {
-				return nil, fmt.Errorf("failed to resolve database path: %w", err)
+				return nil, fmt.Errorf("failed to resolve database path '%s': %w", dsn, err)
 			}
-			
+			log.Printf("Resolved database path to: %s", absPath)
+
 			// Get directory
 			dbDir := filepath.Dir(absPath)
-			
+			log.Printf("Database directory: %s", dbDir)
+
 			// Create directory if it doesn't exist
 			if err := os.MkdirAll(dbDir, 0755); err != nil {
-				return nil, fmt.Errorf("failed to create database directory: %w", err)
+				return nil, fmt.Errorf("failed to create database directory '%s': %w", dbDir, err)
 			}
-			
+
 			// Test write permission
 			testFile := filepath.Join(dbDir, ".write_test")
 			f, err := os.Create(testFile)
 			if err != nil {
-				return nil, fmt.Errorf("database directory not writable: %w", err)
+				return nil, fmt.Errorf("database directory '%s' is not writable: %w", dbDir, err)
 			}
 			f.Close()
 			os.Remove(testFile)
+			log.Printf("Database directory is writable")
 		}
 
-		db, err = sql.Open("sqlite3", dsn+"?_foreign_keys=1")
+		db, err = sql.Open("sqlite", dsn+"?_foreign_keys=1")
+		if err != nil {
+			return nil, fmt.Errorf("failed to open SQLite database '%s': %w", dsn, err)
+		}
+		log.Printf("SQLite database opened successfully")
 	} else {
-		return nil, errors.New("PostgreSQL not yet implemented, use SQLite for now")
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %w", err)
+		return nil, fmt.Errorf("unsupported driver '%s', only SQLite is supported (DSN: %s)", driver, dsn)
 	}
 
 	if err := db.Ping(); err != nil {
-		return nil, fmt.Errorf("failed to ping database: %w", err)
+		return nil, fmt.Errorf("failed to ping database '%s': %w", dsn, err)
 	}
+	log.Printf("Database connection established successfully")
 
 	return &Repository{db: db}, nil
 }
@@ -155,6 +170,23 @@ func (r *Repository) GetUserByID(ctx context.Context, id int64) (*User, error) {
 	return user, nil
 }
 
+func (r *Repository) GetUserByUsername(ctx context.Context, username string) (*User, error) {
+	user := &User{}
+	err := r.db.QueryRowContext(ctx,
+		"SELECT id, telegram_id, username, created_at FROM users WHERE username = ?",
+		username,
+	).Scan(&user.ID, &user.TelegramID, &user.Username, &user.CreatedAt)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to query user by username: %w", err)
+	}
+
+	return user, nil
+}
+
 // Payment operations
 
 func (r *Repository) CreatePayment(ctx context.Context, payment *Payment) error {
@@ -179,6 +211,7 @@ func (r *Repository) CreatePayment(ctx context.Context, payment *Payment) error 
 
 func (r *Repository) GetPaymentByID(ctx context.Context, id int64) (*Payment, error) {
 	payment := &Payment{}
+	var proofFileID sql.NullString
 	err := r.db.QueryRowContext(ctx,
 		`SELECT id, user_id, duration_days, device_count, amount, reference_code, payment_comment, status,
 		 proof_file_id, created_at, reviewed_at, reviewed_by
@@ -187,7 +220,7 @@ func (r *Repository) GetPaymentByID(ctx context.Context, id int64) (*Payment, er
 	).Scan(
 		&payment.ID, &payment.UserID, &payment.DurationDays, &payment.DeviceCount,
 		&payment.Amount, &payment.ReferenceCode, &payment.PaymentComment, &payment.Status,
-		&payment.ProofFileID, &payment.CreatedAt, &payment.ReviewedAt, &payment.ReviewedBy,
+		&proofFileID, &payment.CreatedAt, &payment.ReviewedAt, &payment.ReviewedBy,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -195,11 +228,15 @@ func (r *Repository) GetPaymentByID(ctx context.Context, id int64) (*Payment, er
 		}
 		return nil, fmt.Errorf("failed to query payment: %w", err)
 	}
+	if proofFileID.Valid {
+		payment.ProofFileID = proofFileID.String
+	}
 	return payment, nil
 }
 
 func (r *Repository) GetPaymentByReferenceCode(ctx context.Context, referenceCode string) (*Payment, error) {
 	payment := &Payment{}
+	var proofFileID sql.NullString
 	err := r.db.QueryRowContext(ctx,
 		`SELECT id, user_id, duration_days, device_count, amount, reference_code, payment_comment, status,
 		 proof_file_id, created_at, reviewed_at, reviewed_by
@@ -208,13 +245,16 @@ func (r *Repository) GetPaymentByReferenceCode(ctx context.Context, referenceCod
 	).Scan(
 		&payment.ID, &payment.UserID, &payment.DurationDays, &payment.DeviceCount,
 		&payment.Amount, &payment.ReferenceCode, &payment.PaymentComment, &payment.Status,
-		&payment.ProofFileID, &payment.CreatedAt, &payment.ReviewedAt, &payment.ReviewedBy,
+		&proofFileID, &payment.CreatedAt, &payment.ReviewedAt, &payment.ReviewedBy,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to query payment: %w", err)
+	}
+	if proofFileID.Valid {
+		payment.ProofFileID = proofFileID.String
 	}
 	return payment, nil
 }
@@ -234,13 +274,17 @@ func (r *Repository) GetPaymentsByUserIDAndStatus(ctx context.Context, userID in
 	var payments []*Payment
 	for rows.Next() {
 		payment := &Payment{}
+		var proofFileID sql.NullString
 		err := rows.Scan(
 			&payment.ID, &payment.UserID, &payment.DurationDays, &payment.DeviceCount,
 			&payment.Amount, &payment.ReferenceCode, &payment.PaymentComment, &payment.Status,
-			&payment.ProofFileID, &payment.CreatedAt, &payment.ReviewedAt, &payment.ReviewedBy,
+			&proofFileID, &payment.CreatedAt, &payment.ReviewedAt, &payment.ReviewedBy,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan payment: %w", err)
+		}
+		if proofFileID.Valid {
+			payment.ProofFileID = proofFileID.String
 		}
 		payments = append(payments, payment)
 	}
@@ -262,13 +306,17 @@ func (r *Repository) GetPendingPayments(ctx context.Context) ([]*Payment, error)
 	var payments []*Payment
 	for rows.Next() {
 		payment := &Payment{}
+		var proofFileID sql.NullString
 		err := rows.Scan(
 			&payment.ID, &payment.UserID, &payment.DurationDays, &payment.DeviceCount,
 			&payment.Amount, &payment.ReferenceCode, &payment.PaymentComment, &payment.Status,
-			&payment.ProofFileID, &payment.CreatedAt, &payment.ReviewedAt, &payment.ReviewedBy,
+			&proofFileID, &payment.CreatedAt, &payment.ReviewedAt, &payment.ReviewedBy,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan payment: %w", err)
+		}
+		if proofFileID.Valid {
+			payment.ProofFileID = proofFileID.String
 		}
 		payments = append(payments, payment)
 	}

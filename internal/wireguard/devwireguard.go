@@ -2,7 +2,6 @@ package wireguard
 
 import (
 	"context"
-	"io"
 	"log"
 
 	"github.com/skoret/wireguard-bot/internal/provisioning"

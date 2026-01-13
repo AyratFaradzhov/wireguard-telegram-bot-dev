@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -46,6 +48,11 @@ func (b *Bot) handleMessage(msg *tgbotapi.Message) (responses, error) {
 	user, err := b.repo.GetOrCreateUser(ctx, int64(msg.From.ID), msg.From.UserName)
 	if err != nil {
 		return responses{errorMessage(msg.Chat.ID, msg.MessageID, false)}, errors.Wrap(err, "failed to get/create user")
+	}
+
+	// Register admin if this is /start command and user is admin
+	if msg.Command() == "start" && msg.From.UserName != "" {
+		b.registerAdmin(msg.From.UserName, msg.Chat.ID)
 	}
 
 	res0 := tgbotapi.NewMessage(msg.Chat.ID, cmd.text)
@@ -156,30 +163,44 @@ func (b *Bot) handleQuery(query *tgbotapi.CallbackQuery) (responses, error) {
 
 	// Handle callback data
 	data := query.Data
-	responses, err := b.handleCallbackData(ctx, chatID, msgID, user, data)
+	resps, err := b.handleCallbackData(ctx, chatID, msgID, user, data)
 	if err != nil {
 		return responses{errorMessage(chatID, msgID, true)}, err
 	}
 
-	return responses, nil
+	return resps, nil
 }
 
 func (b *Bot) handleCallbackData(ctx context.Context, chatID int64, msgID int, user *storage.User, data string) (responses, error) {
+	log.Printf("handleCallbackData: data='%s', user=%s, chat_id=%d", data, user.Username, chatID)
+	
 	// Handle menu commands
 	if cmd, ok := commands[data]; ok {
-	res0 := tgbotapi.NewEditMessageText(chatID, msgID, cmd.text)
-	res0.ReplyMarkup = cmd.keyboard
-	if cmd.handler == nil {
-		return responses{res0}, nil
-	}
+		res0 := tgbotapi.NewEditMessageText(chatID, msgID, cmd.text)
+		res0.ReplyMarkup = cmd.keyboard
+		if cmd.handler == nil {
+			return responses{res0}, nil
+		}
 		res1, err := cmd.handler(b, chatID, user.ID, user.Username, "")
-	if err != nil {
+		if err != nil {
 			return responses{res0}, err
+		}
+		return append(responses{res0}, res1...), nil
 	}
-	return append(responses{res0}, res1...), nil
-}
 
-	// Handle payment flow
+	// Handle payment proof FIRST (before payment prefix check)
+	if data == "payment_proof" {
+		log.Printf("Handling payment_proof callback for user %s (chat_id: %d, msg_id: %d)", user.Username, chatID, msgID)
+		resps, err := b.handlePaymentProof(ctx, chatID, msgID, user)
+		if err != nil {
+			log.Printf("ERROR in handlePaymentProof: %v", err)
+		} else {
+			log.Printf("handlePaymentProof returned %d responses", len(resps))
+		}
+		return resps, err
+	}
+
+	// Handle payment flow (but not payment_proof, which is handled above)
 	if strings.HasPrefix(data, "payment") {
 		return b.handlePaymentFlow(ctx, chatID, msgID, user, data)
 	}
@@ -202,17 +223,25 @@ func (b *Bot) handleCallbackData(ctx context.Context, chatID int64, msgID int, u
 		return b.handleDeviceCountSelection(ctx, chatID, msgID, user, deviceCount, duration)
 	}
 
-	// Handle payment proof
-	if data == "payment_proof" {
-		return b.handlePaymentProof(ctx, chatID, msgID, user)
-	}
-
 	// Handle admin callbacks
 	if strings.HasPrefix(data, "admin:") {
 		return b.handleAdminCallback(ctx, chatID, msgID, user, data)
 	}
 
-	// Handle payment approval/rejection
+	// Handle admin payment approval/rejection (simplified flow)
+	if strings.HasPrefix(data, "admin_approve:") {
+		paymentIDStr := strings.TrimPrefix(data, "admin_approve:")
+		paymentID, _ := strconv.ParseInt(paymentIDStr, 10, 64)
+		return b.handleAdminApprovePayment(ctx, chatID, msgID, user, paymentID)
+	}
+
+	if strings.HasPrefix(data, "admin_reject:") {
+		paymentIDStr := strings.TrimPrefix(data, "admin_reject:")
+		paymentID, _ := strconv.ParseInt(paymentIDStr, 10, 64)
+		return b.handleAdminRejectPayment(ctx, chatID, msgID, user, paymentID)
+	}
+
+	// Handle payment approval/rejection (legacy)
 	if strings.HasPrefix(data, "approve:") {
 		parts := strings.Split(strings.TrimPrefix(data, "approve:"), ":")
 		paymentID, _ := strconv.ParseInt(parts[0], 10, 64)
@@ -274,29 +303,72 @@ func (b *Bot) handleDeviceCountSelection(ctx context.Context, chatID int64, msgI
 		return responses{errorMessage(chatID, msgID, true)}, errors.Wrap(err, "failed to create payment")
 	}
 
-	text := fmt.Sprintf("📋 Детали оплаты:\n\n"+
-		"Срок: %d дней\n"+
-		"Устройств: %d\n"+
-		"Сумма: %.2f руб.\n\n"+
-		"⚠️ КОММЕНТАРИЙ К ПЕРЕВОДУ:\n"+
+	// Simplified payment flow message
+	text := fmt.Sprintf("💳 Оплата подписки\n\n"+
+		"📋 Детали заявки:\n"+
+		"• Срок: %d дней\n"+
+		"• Устройств: %d\n"+
+		"• Сумма: %.2f руб.\n\n"+
+		"🔑 КОД ЗАЯВКИ:\n"+
 		"`%s`\n\n"+
-		"Вы ОБЯЗАНЫ указать этот комментарий при переводе!\n"+
-		"Платеж без правильного комментария НЕ будет одобрен.\n\n"+
-		"Код заявки: `%s`\n\n"+
-		"Используйте QR-код ниже для оплаты. После оплаты отправьте скриншот через 'Я оплатил'.",
-		duration, deviceCount, float64(amount)/100.0, payment.PaymentComment, payment.ReferenceCode)
+		"━━━━━━━━━━━━━━━━━━━━\n\n"+
+		"📝 Инструкция:\n"+
+		"1. Отсканируйте QR-код ниже\n"+
+		"2. Оплатите нужную сумму\n"+
+		"3. В комментарии к переводу укажите КОД ЗАЯВКИ\n"+
+		"4. После оплаты нажмите «Я оплатил»\n\n"+
+		"⚠️ БЕЗ КОДА ЗАЯВКИ ПЛАТЕЖ НЕ БУДЕТ ПРИНЯТ!",
+		duration, deviceCount, float64(amount)/100.0, payment.ReferenceCode)
 
 	res := tgbotapi.NewEditMessageText(chatID, msgID, text)
 	res.ParseMode = "Markdown"
 	
-	// Show static QR code
-	qrCode := b.billing.GetStaticQRCode()
-	qrImg := createQRFromString(chatID, qrCode)
+	// Keyboard with buttons
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("✅ Я оплатил", "payment_proof"),
+			tgbotapi.NewInlineKeyboardButtonData("❌ Отмена", MenuCmd.Command),
+		),
+	)
+	res.ReplyMarkup = &keyboard
+	
+	// Send static QR code from file
+	qrPhoto := b.sendPaymentQR(chatID)
+	if qrPhoto == nil {
+		// If QR failed to load, show error message
+		errorMsg := tgbotapi.NewEditMessageText(chatID, msgID, 
+			"❌ Ошибка: QR-код не найден. Обратитесь к администратору.")
+		return responses{errorMsg}, nil
+	}
 
-	return responses{res, qrImg}, nil
+	return responses{res, qrPhoto}, nil
 }
 
 func (b *Bot) handlePaymentProof(ctx context.Context, chatID int64, msgID int, user *storage.User) (responses, error) {
+	log.Printf("handlePaymentProof called for user %s (ID: %d, chat_id: %d)", user.Username, user.ID, chatID)
+	
+	// First, check if there's a payment already in pending_review
+	pendingPayments, err := b.repo.GetPaymentsByUserIDAndStatus(ctx, user.ID, storage.PaymentStatusPendingReview)
+	if err == nil && len(pendingPayments) > 0 {
+		// Payment already in review
+		pendingPayment := pendingPayments[len(pendingPayments)-1]
+		text := fmt.Sprintf("⏳ Ваша заявка уже на проверке!\n\n"+
+			"Код заявки: `%s`\n"+
+			"Сумма: %.2f руб.\n"+
+			"Срок: %d дней\n"+
+			"Устройств: %d\n\n"+
+			"Администратор проверит ваш платеж и одобрит его.\n"+
+			"После одобрения вы получите уведомление.",
+			pendingPayment.ReferenceCode,
+			float64(pendingPayment.Amount)/100.0,
+			pendingPayment.DurationDays,
+			pendingPayment.DeviceCount)
+		res := tgbotapi.NewEditMessageText(chatID, msgID, text)
+		res.ParseMode = "Markdown"
+		res.ReplyMarkup = &mainMenuKeyboard
+		return responses{res}, nil
+	}
+
 	// Find latest payment with status "created" for this user
 	payments, err := b.repo.GetPaymentsByUserIDAndStatus(ctx, user.ID, storage.PaymentStatusCreated)
 	if err != nil {
@@ -311,38 +383,90 @@ func (b *Bot) handlePaymentProof(ctx context.Context, chatID int64, msgID int, u
 
 	if pendingPayment == nil {
 		text := "❌ Не найдена ожидающая оплата.\n\n" +
-			"Создайте заявку через 'Оплата/Продление' в меню, затем отправьте скриншот подтверждения оплаты."
+			"Создайте заявку через 'Оплата/Продление' в меню."
 		res := tgbotapi.NewEditMessageText(chatID, msgID, text)
 		res.ReplyMarkup = &mainMenuKeyboard
 		return responses{res}, nil
 	}
 
-	text := fmt.Sprintf("📤 Отправьте скриншот подтверждения оплаты\n\n"+
-		"Код вашей заявки: `%s`\n"+
-		"Сумма: %.2f руб.\n"+
-		"Срок: %d дней\n"+
-		"Устройств: %d\n\n"+
-		"⚠️ КОММЕНТАРИЙ К ПЕРЕВОДУ:\n"+
-		"`%s`\n\n"+
-		"Убедитесь, что в скриншоте виден правильный комментарий к переводу!\n"+
-		"Платеж без правильного комментария НЕ будет одобрен.\n\n"+
-		"Отправьте фото или документ со скриншотом чека/перевода.\n\n"+
-		"Вы также можете указать код заявки в подписи к фото.",
+	// Move payment to pending_review status (simplified - no proof required at this step)
+	// Proof will be checked by admin
+	if err := b.repo.UpdatePaymentStatus(ctx, pendingPayment.ID, storage.PaymentStatusPendingReview, nil); err != nil {
+		log.Printf("ERROR: failed to update payment status to pending_review: %v", err)
+		return responses{errorMessage(chatID, msgID, true)}, errors.Wrap(err, "failed to update payment status")
+	}
+	log.Printf("Payment %d moved to pending_review status", pendingPayment.ID)
+
+	// Notify admin about new payment
+	log.Printf("Calling notifyAdminAboutPayment for payment %d, user %s", pendingPayment.ID, user.Username)
+	b.notifyAdminAboutPayment(ctx, pendingPayment, user.Username)
+
+	text := fmt.Sprintf("✅ Заявка отправлена на проверку!\n\n"+
+		"📋 Ваша заявка:\n"+
+		"• Код заявки: `%s`\n"+
+		"• Сумма: %.2f руб.\n"+
+		"• Срок: %d дней\n"+
+		"• Устройств: %d\n\n"+
+		"⏳ ОЖИДАЕТ ПРОВЕРКИ АДМИНИСТРАТОРОМ\n\n"+
+		"После одобрения вы получите уведомление и VPN конфигурацию.",
 		pendingPayment.ReferenceCode,
 		float64(pendingPayment.Amount)/100.0,
 		pendingPayment.DurationDays,
-		pendingPayment.DeviceCount,
-		pendingPayment.PaymentComment)
+		pendingPayment.DeviceCount)
 
 	res := tgbotapi.NewEditMessageText(chatID, msgID, text)
 	res.ParseMode = "Markdown"
-	res.ReplyMarkup = &tgbotapi.InlineKeyboardMarkup{
-		InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{
-			{goToMenuButton},
-		},
-	}
+	res.ReplyMarkup = &mainMenuKeyboard
 
 	return responses{res}, nil
+}
+
+// notifyAdminAboutPayment sends notification to all admins about new payment
+func (b *Bot) notifyAdminAboutPayment(ctx context.Context, payment *storage.Payment, username string) {
+	log.Printf("notifyAdminAboutPayment called for payment %d, username %s", payment.ID, username)
+	adminChatIDs := b.getAdminChatIDs()
+	log.Printf("Found %d admin chat IDs: %v", len(adminChatIDs), adminChatIDs)
+	if len(adminChatIDs) == 0 {
+		log.Printf("WARNING: No admin chat IDs registered, cannot send notification. Admin must send /start first.")
+		return
+	}
+
+	paymentUser, err := b.repo.GetUserByID(ctx, payment.UserID)
+	if err == nil && paymentUser != nil {
+		username = paymentUser.Username
+	}
+
+	text := fmt.Sprintf("💳 НОВАЯ ОПЛАТА\n\n"+
+		"👤 Пользователь: @%s\n"+
+		"📆 Срок: %d дней\n"+
+		"📱 Устройств: %d\n"+
+		"💰 Сумма: %.2f ₽\n\n"+
+		"🔑 Код заявки:\n`%s`",
+		username,
+		payment.DurationDays,
+		payment.DeviceCount,
+		float64(payment.Amount)/100.0,
+		payment.ReferenceCode)
+
+	// Create keyboard with approve/reject buttons
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("✅ Подтвердить", fmt.Sprintf("admin_approve:%d", payment.ID)),
+			tgbotapi.NewInlineKeyboardButtonData("❌ Отклонить", fmt.Sprintf("admin_reject:%d", payment.ID)),
+		),
+	)
+
+	// Send to all registered admin chat IDs
+	for _, chatID := range adminChatIDs {
+		msg := tgbotapi.NewMessage(chatID, text)
+		msg.ParseMode = "Markdown"
+		msg.ReplyMarkup = &keyboard
+		if err := b.send(msg); err != nil {
+			log.Printf("failed to notify admin (chat_id: %d): %v", chatID, err)
+		} else {
+			log.Printf("Notification sent to admin (chat_id: %d)", chatID)
+		}
+	}
 }
 
 func (b *Bot) handleAdminCallback(ctx context.Context, chatID int64, msgID int, user *storage.User, data string) (responses, error) {
@@ -489,9 +613,19 @@ func (b *Bot) handleApprovePayment(ctx context.Context, chatID int64, msgID int,
 		return responses{errorMessage(chatID, msgID, true)}, errors.New("not an admin")
 	}
 
-	// If comment is not provided, show verification step
+	// If comment is not provided, use payment's comment (simplified flow)
 	if verifiedComment == "" {
-		return b.handleApprovePaymentVerify(ctx, chatID, msgID, user, paymentID)
+		payment, err := b.repo.GetPaymentByID(ctx, paymentID)
+		if err != nil || payment == nil {
+			return responses{errorMessage(chatID, msgID, true)}, errors.New("payment not found")
+		}
+		verifiedComment = payment.PaymentComment
+	}
+
+	// Get payment before approval to get user info
+	payment, err := b.repo.GetPaymentByID(ctx, paymentID)
+	if err != nil || payment == nil {
+		return responses{errorMessage(chatID, msgID, true)}, errors.New("payment not found")
 	}
 
 	// Verify and approve payment
@@ -508,19 +642,166 @@ func (b *Bot) handleApprovePayment(ctx context.Context, chatID int64, msgID int,
 		return responses{res}, nil
 	}
 
-	payment, _ := b.repo.GetPaymentByID(ctx, paymentID)
+	// Get updated payment and user after approval
 	paymentUser, _ := b.repo.GetUserByID(ctx, payment.UserID)
-
+	
 	text := fmt.Sprintf("✅ Платеж одобрен!\n\nПодписка активирована.")
 	res := tgbotapi.NewEditMessageText(chatID, msgID, text)
 	res.ReplyMarkup = &adminKeyboard
 
+	// Automatically create device and send config to user
+	if paymentUser != nil {
+		// Get active subscription (created by AdminApprovePayment)
+		subscription, err := b.repo.GetActiveSubscriptionByUserID(ctx, payment.UserID)
+		if err == nil && subscription != nil {
+			// Create device automatically
+			deviceCount, _ := b.repo.CountActiveDevicesBySubscription(ctx, subscription.ID)
+			deviceName := fmt.Sprintf("device_%d", deviceCount+1)
+			
+			// Create WireGuard config
+			cfg, _, assignedIP, err := b.wireguard.CreateConfigForNewKeys(ctx, payment.UserID, subscription.ID, deviceName)
+			if err == nil {
+				content, err := io.ReadAll(cfg)
+				if err == nil {
+					// Send notification with config
+					notifyText := fmt.Sprintf("✅ Ваш платеж одобрен!\n\n"+
+						"Подписка активирована на %d дней.\n"+
+						"Устройств: %d\n\n"+
+						"📱 Ваш WireGuard конфиг готов!\n"+
+						"IP адрес: %s\n\n"+
+						"Используйте QR-код для подключения на телефоне или скачайте .conf файл для ПК.",
+						payment.DurationDays, payment.DeviceCount, assignedIP)
+					
+					msg := tgbotapi.NewMessage(paymentUser.TelegramID, notifyText)
+					file := createFile(paymentUser.TelegramID, content)
+					qr := createQR(paymentUser.TelegramID, content)
+					
+					// Send messages
+					b.send(msg)
+					if qr != nil {
+						b.send(qr)
+					}
+					b.send(file)
+				} else {
+					log.Printf("failed to read config: %v", err)
+					// Fallback notification
+					notifyText := fmt.Sprintf("✅ Ваш платеж одобрен!\n\n"+
+						"Подписка активирована на %d дней.\n"+
+						"Вы можете создать устройства через /newkeys",
+						payment.DurationDays)
+					b.SendNotification(paymentUser.TelegramID, notifyText)
+				}
+			} else {
+				log.Printf("failed to create device: %v", err)
+				// Fallback notification
+				notifyText := fmt.Sprintf("✅ Ваш платеж одобрен!\n\n"+
+					"Подписка активирована на %d дней.\n"+
+					"Вы можете создать устройства через /newkeys",
+					payment.DurationDays)
+				b.SendNotification(paymentUser.TelegramID, notifyText)
+			}
+		} else {
+			// Fallback notification if subscription not found
+			notifyText := fmt.Sprintf("✅ Ваш платеж одобрен!\n\n"+
+				"Подписка активирована на %d дней.\n"+
+				"Вы можете создать устройства через /newkeys",
+				payment.DurationDays)
+			b.SendNotification(paymentUser.TelegramID, notifyText)
+		}
+	}
+
+	return responses{res}, nil
+}
+
+// handleAdminApprovePayment - simplified admin approval (from notification)
+func (b *Bot) handleAdminApprovePayment(ctx context.Context, chatID int64, msgID int, user *storage.User, paymentID int64) (responses, error) {
+	if !b.isAdmin(user.Username) {
+		return responses{errorMessage(chatID, msgID, true)}, errors.New("not an admin")
+	}
+
+	// Get payment
+	payment, err := b.repo.GetPaymentByID(ctx, paymentID)
+	if err != nil || payment == nil {
+		return responses{errorMessage(chatID, msgID, true)}, errors.New("payment not found")
+	}
+
+	// Approve payment (use payment's comment as verified)
+	if err := b.billing.AdminApprovePayment(ctx, paymentID, user.Username, payment.PaymentComment); err != nil {
+		errMsg := fmt.Sprintf("❌ Ошибка при одобрении:\n\n%s", err.Error())
+		res := tgbotapi.NewEditMessageText(chatID, msgID, errMsg)
+		return responses{res}, nil
+	}
+
+	// Update message
+	text := "✅ Платеж одобрен!\n\nПодписка активирована."
+	res := tgbotapi.NewEditMessageText(chatID, msgID, text)
+
+	// Get user and send VPN config
+	paymentUser, _ := b.repo.GetUserByID(ctx, payment.UserID)
+	if paymentUser != nil {
+		// Get active subscription
+		subscription, err := b.repo.GetActiveSubscriptionByUserID(ctx, payment.UserID)
+		if err == nil && subscription != nil {
+			// Create device automatically
+			deviceCount, _ := b.repo.CountActiveDevicesBySubscription(ctx, subscription.ID)
+			deviceName := fmt.Sprintf("device_%d", deviceCount+1)
+			
+			// Create WireGuard config
+			cfg, _, assignedIP, err := b.wireguard.CreateConfigForNewKeys(ctx, payment.UserID, subscription.ID, deviceName)
+			if err == nil {
+				content, err := io.ReadAll(cfg)
+				if err == nil {
+					// Send notification with config
+					notifyText := fmt.Sprintf("✅ Ваш платеж одобрен!\n\n"+
+						"Подписка активирована на %d дней.\n"+
+						"Устройств: %d\n\n"+
+						"📱 Ваш WireGuard конфиг готов!\n"+
+						"IP адрес: %s\n\n"+
+						"Используйте QR-код для подключения на телефоне или скачайте .conf файл для ПК.",
+						payment.DurationDays, payment.DeviceCount, assignedIP)
+					
+					msg := tgbotapi.NewMessage(paymentUser.TelegramID, notifyText)
+					file := createFile(paymentUser.TelegramID, content)
+					qr := createQR(paymentUser.TelegramID, content)
+					
+					// Send messages
+					b.send(msg)
+					if qr != nil {
+						b.send(qr)
+					}
+					b.send(file)
+					log.Printf("VPN config sent to user %d", paymentUser.TelegramID)
+				} else {
+					log.Printf("failed to read config: %v", err)
+				}
+			} else {
+				log.Printf("failed to create device: %v", err)
+			}
+		}
+	}
+
+	return responses{res}, nil
+}
+
+// handleAdminRejectPayment - simplified admin rejection (from notification)
+func (b *Bot) handleAdminRejectPayment(ctx context.Context, chatID int64, msgID int, user *storage.User, paymentID int64) (responses, error) {
+	if !b.isAdmin(user.Username) {
+		return responses{errorMessage(chatID, msgID, true)}, errors.New("not an admin")
+	}
+
+	if err := b.billing.AdminRejectPayment(ctx, paymentID, user.Username); err != nil {
+		return responses{errorMessage(chatID, msgID, true)}, errors.Wrap(err, "failed to reject payment")
+	}
+
+	payment, _ := b.repo.GetPaymentByID(ctx, paymentID)
+	paymentUser, _ := b.repo.GetUserByID(ctx, payment.UserID)
+
+	text := "❌ Платеж отклонен."
+	res := tgbotapi.NewEditMessageText(chatID, msgID, text)
+
 	// Notify user
 	if paymentUser != nil {
-		notifyText := fmt.Sprintf("✅ Ваш платеж одобрен!\n\n"+
-			"Подписка активирована на %d дней.\n"+
-			"Вы можете создать устройства через /newkeys",
-			payment.DurationDays)
+		notifyText := "❌ Ваш платеж отклонен администратором.\n\nОбратитесь в поддержку для уточнения деталей."
 		b.SendNotification(paymentUser.TelegramID, notifyText)
 	}
 
@@ -578,7 +859,7 @@ func (b *Bot) handleConfigForNewKeys(chatID int64, userID int64, username string
 	deviceName := fmt.Sprintf("device_%d", deviceCount+1)
 
 	// Create config
-	cfg, publicKey, assignedIP, err := b.wireguard.CreateConfigForNewKeys(ctx, userID, subscription.ID, deviceName)
+	cfg, _, _, err := b.wireguard.CreateConfigForNewKeys(ctx, userID, subscription.ID, deviceName)
 	if err != nil {
 		return responses{errorMessage(chatID, 0, false)}, errors.Wrap(err, "failed to create new config")
 	}
@@ -629,26 +910,38 @@ func createQR(chatID int64, content []byte) tgbotapi.Chattable {
 	})
 }
 
-func createQRFromString(chatID int64, qrString string) tgbotapi.Chattable {
-	options := []qrcode.ImageOption{
-		qrcode.WithQRWidth(7),
-		qrcode.WithBuiltinImageEncoder(qrcode.PNG_FORMAT),
+// sendPaymentQR sends the static payment QR code from file
+func (b *Bot) sendPaymentQR(chatID int64) tgbotapi.Chattable {
+	if b.paymentQRPath == "" {
+		log.Printf("PAYMENT_QR_PATH is not set, cannot send QR code")
+		return nil
 	}
-	qrc, err := qrcode.New(qrString, options...)
+	
+	// Read file content into bytes
+	fileBytes, err := os.ReadFile(b.paymentQRPath)
 	if err != nil {
-		log.Printf("failed to create qr code: %v", err)
+		log.Printf("failed to read payment QR file '%s': %v", b.paymentQRPath, err)
 		return nil
 	}
-	buf := bytes.Buffer{}
-	if err := qrc.SaveTo(&buf); err != nil {
-		log.Printf("failed to read new qr code: %v", err)
+	
+	if len(fileBytes) == 0 {
+		log.Printf("payment QR file '%s' is empty", b.paymentQRPath)
 		return nil
 	}
-	name := strconv.FormatInt(time.Now().Unix(), 10)
-	return tgbotapi.NewPhoto(chatID, tgbotapi.FileReader{
-		Name:   name + ".png",
-		Reader: &buf,
+	
+	// Get file name from path
+	fileName := filepath.Base(b.paymentQRPath)
+	if fileName == "" || fileName == "." {
+		fileName = "payment_qr.png"
+	}
+	
+	// Send photo from file bytes
+	photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileBytes{
+		Name:  fileName,
+		Bytes: fileBytes,
 	})
+	photo.Caption = "QR-код для оплаты"
+	return photo
 }
 
 func init() {
